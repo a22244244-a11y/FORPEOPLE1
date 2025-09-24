@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>단순계산기 · 포피플</title>
+    <meta name="description" content="포피플 단순 계산기 · 모두의요금제" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script defer src="https://unpkg.com/@supabase/supabase-js@2.47.10/dist/umd/supabase.min.js"></script>
+    <style>
+      table { border-collapse: collapse; }
+      th, td { border-color: #eee; }
+      input[type="number"]::-webkit-outer-spin-button,
+      input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+      input[type="number"] { -moz-appearance: textfield; }
+      .brand-shadow { box-shadow: 0 8px 24px rgba(0,0,0,0.06); }
+    </style>
+  </head>
+  <body class="bg-gray-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useEffect, useMemo, useState } = React;
+
+      // --- Router (hash) ---
+      function useHashRoute() {
+        const [hash, setHash] = useState(window.location.hash || "#/app");
+        useEffect(() => {
+          const onHash = () => setHash(window.location.hash || "#/app");
+          window.addEventListener("hashchange", onHash);
+          return () => window.removeEventListener("hashchange", onHash);
+        }, []);
+        return hash.replace(/^#/, "");
+      }
+
+      // --- Storage keys ---
+      const LS_BRAND = "simple-calc-branding-v1";
+      const LS_CFG   = "simple-calc-supa-config-v1"; // {url, anonKey}
+      const LS_PIN   = "simple-calc-admin-pin-v1";   // soft gate
+
+      // --- Helpers ---
+      const readJSON = (k, f) => { try{ const t=localStorage.getItem(k); return t?JSON.parse(t):f; } catch { return f; } };
+      const writeJSON = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+      function readBrand() {
+        return readJSON(LS_BRAND, { poppeopleLogo: "", planLogo: "", primaryColor: "#111827" });
+      }
+      function writeBrand(b) { writeJSON(LS_BRAND, b); }
+
+      function readCfg() { return readJSON(LS_CFG, { url: "", anonKey: "" }); }
+      function writeCfg(c) { writeJSON(LS_CFG, c); }
+
+      function readPIN() { return localStorage.getItem(LS_PIN) || ""; }
+      function writePIN(p) { localStorage.setItem(LS_PIN, p || ""); }
+
+      function applyFavicon(url) {
+        if (!url) return;
+        const link = document.querySelector('link[rel="icon"]') || document.createElement("link");
+        link.rel = "icon";
+        link.href = url;
+        document.head.appendChild(link);
+      }
+
+      // --- Supabase client (lazy) ---
+      let supa = null;
+      function getSupabase() {
+        const cfg = readCfg();
+        if (!cfg.url || !cfg.anonKey) return null;
+        if (supa) return supa;
+        supa = window.supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: false } });
+        return supa;
+      }
+
+      // --- DB SQL Guide ---
+      const SQL_GUIDE = `-- 1) plans 테이블 생성
+create table if not exists public.plans (
+  id bigserial primary key,
+  device text,
+  carrier text,
+  entryType text,
+  source text,
+  msrp numeric,
+  carrierSubsidy numeric,
+  channelSubsidy numeric,
+  inserted_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- 2) updated_at 자동 반영
+create or replace function public.set_updated_at()
+returns trigger as $$ begin new.updated_at = now(); return new; end; $$ language plpgsql;
+drop trigger if exists trg_plans_updated on public.plans;
+create trigger trg_plans_updated before update on public.plans
+for each row execute function public.set_updated_at();
+
+-- 3) RLS 켜기 및 정책(내부 도구용: 익명 읽기/쓰기 허용)
+alter table public.plans enable row level security;
+do $$ begin
+  if not exists (select 1 from pg_policies where polname='plans_select_all') then
+    create policy plans_select_all on public.plans for select using (true);
+  end if;
+  if not exists (select 1 from pg_policies where polname='plans_write_all') then
+    create policy plans_write_all on public.plans for all using (true) with check (true);
+  end if;
+end $$;`;
+
+      // --- Components ---
+      function AdminPage() {
+        const [brand, setBrand] = useState(readBrand());
+        const [cfg, setCfg] = useState(readCfg());
+        const [pin, setPin] = useState(readPIN());
+        const [inPin, setInPin] = useState("");
+        const [rows, setRows] = useState([]);
+        const [info, setInfo] = useState("");
+
+        useEffect(() => { writeBrand(brand); applyFavicon(brand.poppeopleLogo || brand.planLogo); }, [brand]);
+        useEffect(() => { writeCfg(cfg); }, [cfg]);
+        useEffect(() => { writePIN(pin); }, [pin]);
+
+        // Load from DB
+        const load = async () => {
+          const sb = getSupabase();
+          if (!sb) { setInfo("Supabase 설정 필요"); return; }
+          const { data, error } = await sb.from("plans").select("*").order("updated_at", { ascending: false });
+          if (error) { setInfo("불러오기 실패: " + error.message); return; }
+          setRows(data || []);
+          setInfo(`불러오기 완료: ${data?.length||0}건`);
+        };
+
+        useEffect(() => { load(); }, [cfg.url, cfg.anonKey]);
+
+        const addRow = () => setRows(r => [{ device:"", carrier:"LGU+", entryType:"번호이동", source:"", msrp:0, carrierSubsidy:0, channelSubsidy:0 }, ...r]);
+
+        const saveAll = async () => {
+          const sb = getSupabase(); if (!sb) return alert("Supabase 설정 먼저!");
+          // sanitize + upsert
+          const clean = rows.map(r => ({
+            id: r.id || undefined,
+            device: r.device||null,
+            carrier: r.carrier||null,
+            entryType: r.entryType||null,
+            source: r.source||null,
+            msrp: Number(r.msrp||0),
+            carrierSubsidy: Number(r.carrierSubsidy||0),
+            channelSubsidy: Number(r.channelSubsidy||0),
+          }));
+          const { data, error } = await sb.from("plans").upsert(clean).select();
+          if (error) return alert("저장 실패: " + error.message);
+          setRows(data||[]);
+          setInfo(`저장 완료: ${data?.length||0}건`);
+        };
+
+        const removeRow = async (id, idx) => {
+          const sb = getSupabase(); if (!sb) return alert("Supabase 설정 먼저!");
+          if (id) {
+            const { error } = await sb.from("plans").delete().eq("id", id);
+            if (error) return alert("삭제 실패: " + error.message);
+          }
+          setRows(r => r.filter((_,i)=>i!==idx));
+        };
+
+        if (!pin) {
+          // 최초 PIN 설정
+          return (
+            <div className="min-h-screen grid place-items-center p-6">
+              <div className="max-w-md w-full bg-white p-6 rounded-2xl shadow">
+                <h1 className="text-xl font-bold mb-4">Admin PIN 설정</h1>
+                <input className="w-full border rounded-xl px-3 py-2 mb-3" placeholder="숫자 4~6자리 예: 1357" value={inPin} onChange={(e)=>setInPin(e.target.value)} />
+                <button className="w-full px-3 py-2 rounded-xl bg-gray-900 text-white" onClick={()=>{ if(!inPin) return; setPin(inPin); alert("PIN 저장됨"); }}>저장</button>
+                <p className="mt-3 text-xs text-gray-500">* 이 PIN은 이 브라우저에 저장됩니다. 내부용 간편 보호입니다.</p>
+              </div>
+            </div>
+          );
+        }
+
+        // PIN 확인
+        const gateOK = sessionStorage.getItem("admin_ok") === "1";
+        const [chk, setChk] = useState(gateOK);
+        const [tryPin, setTryPin] = useState("");
+
+        if (!chk) {
+          return (
+            <div className="min-h-screen grid place-items-center p-6">
+              <div className="max-w-md w-full bg-white p-6 rounded-2xl shadow">
+                <h1 className="text-xl font-bold mb-4">Admin 로그인</h1>
+                <input className="w-full border rounded-xl px-3 py-2 mb-3" placeholder="PIN 입력" value={tryPin} onChange={(e)=>setTryPin(e.target.value)} />
+                <button className="w-full px-3 py-2 rounded-xl bg-gray-900 text-white" onClick={()=>{
+                  if (tryPin===pin) { sessionStorage.setItem("admin_ok","1"); setChk(true); load(); }
+                  else alert("PIN 불일치");
+                }}>입장</button>
+                <p className="mt-3 text-xs text-gray-500">* 내부용 보호입니다. 보다 강한 보안을 원하면 Supabase RLS를 조정하세요.</p>
+              </div>
+            </div>
+          );
+        }
+
+        return (
+          <div className="min-h-screen p-6 bg-gray-50">
+            <div className="max-w-6xl mx-auto space-y-6">
+              <header className="flex items-center justify-between">
+                <h1 className="text-2xl font-bold">단순계산기 Admin</h1>
+                <a href="#/app" className="px-3 py-2 rounded-xl bg-white border">사용자 계산기로 가기</a>
+              </header>
+
+              {/* 설정 */}
+              <div className="bg-white rounded-2xl border p-4 brand-shadow">
+                <div className="grid md:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Supabase URL</label>
+                    <input className="w-full border rounded-xl px-3 py-2" value={cfg.url} onChange={(e)=>setCfg({...cfg, url:e.target.value})} placeholder="https://xxxxx.supabase.co" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Supabase anon key</label>
+                    <input className="w-full border rounded-xl px-3 py-2" value={cfg.anonKey} onChange={(e)=>setCfg({...cfg, anonKey:e.target.value})} placeholder="eyJhbGciOi..." />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">메인 색상</label>
+                    <input type="color" className="w-full border rounded-xl px-3 py-2 h-10" value={brand.primaryColor} onChange={(e)=>setBrand({...brand, primaryColor:e.target.value})} />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">포피플 로고 URL</label>
+                    <input className="w-full border rounded-xl px-3 py-2" value={brand.poppeopleLogo} onChange={(e)=>setBrand({...brand, poppeopleLogo:e.target.value})} placeholder="https://예시.com/pop.png" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">모두의요금제 로고 URL</label>
+                    <input className="w-full border rounded-xl px-3 py-2" value={brand.planLogo} onChange={(e)=>setBrand({...brand, planLogo:e.target.value})} placeholder="https://예시.com/plan.png" />
+                  </div>
+                  <div className="flex items-end">
+                    <button className="w-full px-3 py-2 rounded-xl text-white" style={{background:brand.primaryColor}} onClick={load}>DB 불러오기</button>
+                  </div>
+                </div>
+                <details className="mt-3">
+                  <summary className="cursor-pointer text-sm font-semibold">DB 초기화 (SQL 가이드 보기)</summary>
+                  <pre className="whitespace-pre-wrap text-xs p-3 bg-gray-50 rounded-xl mt-2">{SQL_GUIDE}</pre>
+                  <p className="text-xs text-gray-500 mt-2">Supabase → SQL Editor에 붙여넣고 실행하세요. 실행 후 <b>DB 불러오기</b>를 누르세요.</p>
+                </details>
+              </div>
+
+              {/* 데이터 관리 */}
+              <div className="bg-white rounded-2xl border p-4 brand-shadow">
+                <div className="flex flex-wrap gap-2 items-center mb-3">
+                  <button className="px-3 py-2 rounded-xl bg-white border" onClick={addRow}>행 추가</button>
+                  <button className="px-3 py-2 rounded-xl text-white" style={{background:brand.primaryColor}} onClick={saveAll}>저장</button>
+                  <span className="text-sm text-gray-600">{info}</span>
+                </div>
+
+                <div className="overflow-auto bg-white rounded-2xl shadow p-3">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b">
+                        <th className="p-2">단말기명</th>
+                        <th className="p-2">통신사</th>
+                        <th className="p-2">개통유형</th>
+                        <th className="p-2">인입경로</th>
+                        <th className="p-2">출고가</th>
+                        <th className="p-2">이통사지원금</th>
+                        <th className="p-2">유통망지원금</th>
+                        <th className="p-2 w-20">-</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r,i)=>(
+                        <tr key={r.id || i} className="border-b last:border-0">
+                          <td className="p-2"><input className="w-full border rounded-lg px-2 py-1" value={r.device||""} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], device:e.target.value}; return n;})} /></td>
+                          <td className="p-2">
+                            <select className="w-full border rounded-lg px-2 py-1" value={r.carrier||"LGU+"} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], carrier:e.target.value}; return n;})}>
+                              {["LGU+","KT","SKT"].map(c=><option key={c} value={c}>{c}</option>)}
+                            </select>
+                          </td>
+                          <td className="p-2">
+                            <select className="w-full border rounded-lg px-2 py-1" value={r.entryType||"번호이동"} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], entryType:e.target.value}; return n;})}>
+                              {["번호이동","기기변경"].map(t=><option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </td>
+                          <td className="p-2"><input className="w-full border rounded-lg px-2 py-1" value={r.source||""} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], source:e.target.value}; return n;})} /></td>
+                          <td className="p-2"><input type="number" className="w-full border rounded-lg px-2 py-1 text-right" value={r.msrp||0} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], msrp:Number(e.target.value||0)}; return n;})} /></td>
+                          <td className="p-2"><input type="number" className="w-full border rounded-lg px-2 py-1 text-right" value={r.carrierSubsidy||0} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], carrierSubsidy:Number(e.target.value||0)}; return n;})} /></td>
+                          <td className="p-2"><input type="number" className="w-full border rounded-lg px-2 py-1 text-right" value={r.channelSubsidy||0} onChange={(e)=>setRows(rs=>{const n=[...rs]; n[i]={...n[i], channelSubsidy:Number(e.target.value||0)}; return n;})} /></td>
+                          <td className="p-2 text-right"><button className="px-2 py-1 text-red-600" onClick={()=>removeRow(r.id, i)}>삭제</button></td>
+                        </tr>
+                      ))}
+                      {rows.length===0 && <tr><td colSpan="8" className="p-4 text-center text-gray-500">DB에 데이터가 없습니다. 행 추가 후 저장을 눌러보세요.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function AppPage() {
+        const [brand] = useState(readBrand());
+        const [rows, setRows] = useState([]);
+        const [carrier, setCarrier] = useState("LGU+");
+        const [entryType, setEntryType] = useState("번호이동");
+        const [source, setSource] = useState("");
+        const [device, setDevice] = useState("");
+        const [months, setMonths] = useState(24);
+        const [annualRate, setAnnualRate] = useState(5.9);
+
+        useEffect(()=>{ applyFavicon(brand.poppeopleLogo || brand.planLogo); }, [brand]);
+
+        const load = async () => {
+          const sb = getSupabase(); if(!sb) return;
+          const { data, error } = await sb.from("plans").select("*").order("updated_at", { ascending:false });
+          if (!error) setRows(data||[]);
+        };
+
+        // realtime subscribe
+        useEffect(() => {
+          const sb = getSupabase(); if(!sb) return;
+          load();
+          const channel = sb.channel("plans-realtime").on("postgres_changes", { event: "*", schema: "public", table: "plans" }, payload => { load(); }).subscribe();
+          return () => { sb.removeChannel(channel); };
+        }, [readCfg().url, readCfg().anonKey]);
+
+        const entryTypeOptions = useMemo(() => {
+          const s = Array.from(new Set(rows.map((r) => r.entryType).filter(Boolean)));
+          return s.length ? s : ["번호이동", "기기변경"];
+        }, [rows]);
+
+        const devices = useMemo(() => rows
+          .filter(r => (!carrier || r.carrier===carrier) && (!entryType || r.entryType===entryType) && (!source || r.source===source))
+          .map(r => r.device).filter(Boolean), [rows, carrier, entryType, source]);
+
+        const sourcesList = useMemo(() => Array.from(new Set(rows
+          .filter(r => (!carrier || r.carrier===carrier) && (!entryType || r.entryType===entryType))
+          .map(r => r.source).filter(Boolean))), [rows, carrier, entryType]);
+
+        const selected = useMemo(() => rows.find(r => r.carrier===carrier && r.entryType===entryType && (!source || r.source===source) && r.device===device) || null, [rows, carrier, entryType, source, device]);
+
+        const msrp = selected?.msrp || 0;
+        const carrierSubsidy = selected?.carrierSubsidy || 0;
+        const channelSubsidy = selected?.channelSubsidy || 0;
+        const principal = Math.max(0, msrp - carrierSubsidy - channelSubsidy);
+        const r = (annualRate/12/100);
+        const n = Math.max(1, Math.floor(months||0));
+        const monthlyInstall = r===0 ? (principal/n) : (principal * r * Math.pow(1+r, n)) / (Math.pow(1+r,n)-1);
+        const baseFee = 85000;
+        const monthlyTotal = baseFee + monthlyInstall;
+
+        return (
+          <div className="min-h-screen bg-gray-50 p-6">
+            <div className="max-w-3xl mx-auto space-y-4">
+              <div className="bg-white rounded-2xl p-4 flex items-center justify-between brand-shadow">
+                <div className="flex items-center gap-3">
+                  {brand.poppeopleLogo ? <img src={brand.poppeopleLogo} alt="Pop People" className="h-8 md:h-10 object-contain" /> : <div className="h-8 md:h-10 w-24 bg-gray-200 rounded" />}
+                  <div className="w-px h-6 bg-gray-200 hidden md:block" />
+                  {brand.planLogo ? <img src={brand.planLogo} alt="모두의요금제" className="h-8 md:h-10 object-contain" /> : <div className="h-8 md:h-10 w-24 bg-gray-200 rounded" />}
+                </div>
+                <a href="#/admin" className="px-3 py-2 rounded-xl text-white" style={{background: brand.primaryColor||'#111827'}}>Admin</a>
+              </div>
+
+              <div className="bg-white rounded-2xl shadow p-4 space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">개통유형</label>
+                    <select className="w-full border rounded-xl px-3 py-2" value={entryType} onChange={(e)=>{ setEntryType(e.target.value); setDevice(""); }}>
+                      {entryTypeOptions.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">통신사</label>
+                    <select className="w-full border rounded-xl px-3 py-2" value={carrier} onChange={(e)=>{ setCarrier(e.target.value); setDevice(""); }}>
+                      {Array.from(new Set(rows.map(r=>r.carrier))).map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">인입경로</label>
+                    <select className="w-full border rounded-xl px-3 py-2" value={source} onChange={(e)=>{ setSource(e.target.value); setDevice(""); }}>
+                      <option value="">전체</option>
+                      {sourcesList.map(s => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-sm text-gray-600 mb-1">단말기명</label>
+                    <select className="w-full border rounded-xl px-3 py-2" value={device} onChange={(e)=>setDevice(e.target.value)}>
+                      <option value="" disabled>{devices.length ? "단말기를 선택하세요" : "선택 가능한 단말이 없습니다 (Admin에서 데이터 입력 후 저장)"}</option>
+                      {devices.map(d => <option key={d} value={d}>{d}</option>)}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">출고가 (자동)</label>
+                    <input className="w-full border rounded-xl px-3 py-2 bg-gray-50" value={msrp ? Number(msrp).toLocaleString("ko-KR") : "-"} readOnly />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">이통사지원금 (자동)</label>
+                    <input className="w-full border rounded-xl px-3 py-2 bg-gray-50" value={carrierSubsidy ? Number(carrierSubsidy).toLocaleString("ko-KR") : "-"} readOnly />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">유통망지원금 (자동)</label>
+                    <input className="w-full border rounded-xl px-3 py-2 bg-gray-50" value={channelSubsidy ? Number(channelSubsidy).toLocaleString("ko-KR") : "-"} readOnly />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">할부개월 (직접 입력)</label>
+                    <input type="number" min="1" max="48" className="w-full border rounded-xl px-3 py-2" value={months} onChange={(e)=>setMonths(Number(e.target.value||0))} />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">연이율 (%)</label>
+                    <input type="number" step="0.1" className="w-full border rounded-xl px-3 py-2" value={annualRate} onChange={(e)=>setAnnualRate(Number(e.target.value))} />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-600 mb-1">할부원금 (자동)</label>
+                    <input className="w-full border rounded-xl px-3 py-2 bg-gray-50" value={principal ? Number(principal).toLocaleString("ko-KR") : "-"} readOnly />
+                  </div>
+                </div>
+
+                <div className="border-t pt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="p-3 rounded-xl bg-gray-50">
+                    <div className="text-sm text-gray-500">월 할부금 (원리금균등)</div>
+                    <div className="text-2xl font-bold">{device ? Math.round(monthlyInstall).toLocaleString("ko-KR") : "-"}원</div>
+                  </div>
+                  <div className="p-3 rounded-xl bg-gray-50">
+                    <div className="text-sm text-gray-500">기본료</div>
+                    <div className="text-2xl font-bold">{(85000).toLocaleString("ko-KR")}원</div>
+                  </div>
+                  <div className="p-3 rounded-xl text-white" style={{background: brand.primaryColor||'#111827'}}>
+                    <div className="text-sm opacity-90">예상 월 청구금액</div>
+                    <div className="text-2xl font-extrabold">{device ? Math.round(monthlyTotal).toLocaleString("ko-KR") : "-"}원</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function Page() {
+        const route = useHashRoute();
+        return route === "/admin" ? <AdminPage /> : <AppPage />;
+      }
+
+      // Mount
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(React.createElement(Page));
+    </script>
+  </body>
+</html>
